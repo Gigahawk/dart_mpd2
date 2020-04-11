@@ -1,0 +1,1 @@
+const String HELLO_PREFIX = 'OK MPD ';

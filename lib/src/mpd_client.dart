@@ -1,16 +1,24 @@
+import 'dart:async';
 import 'dart:io';
+import 'package:pedantic/pedantic.dart';
 
+import 'string_socket.dart';
 import 'utils.dart';
 import 'error.dart';
 import 'mpd_client_base.dart';
+import 'constants.dart';
+
 
 class MPDClient extends MPDClientBase {
   List<String> _pending;
   bool _iterating;
   int timeout;
-  RawSynchronousSocket _sock;
+  Socket _sock;
+  Stream<String> _stringStream;
 
   MPDClient(bool useUnicode) : super(useUnicode);
+
+  Future<void> clearerror();
 
   @override
   void reset() {
@@ -18,11 +26,12 @@ class MPDClient extends MPDClientBase {
     _pending = [];
     _iterating = false;
     _sock = null;
+    _stringStream = null;
   }
 
-  void connect(String host, {String port, int timeout}) {
+  Future<void> connect(String host, {String port, int timeout}) async {
     if(_sock != null) {
-      throw ConnectionException("Already connected");
+      throw ConnectionException('Already connected');
     }
 
     if(timeout != null) {
@@ -31,45 +40,57 @@ class MPDClient extends MPDClientBase {
     }
 
     if(host.startsWith('/')) {
-      _sock = _connect_unix(host);
+      _sock = await _connect_unix(host);
     } else {
       if(port == null) {
         throw FormatException(
-          "port must be specified when connecting via tcp");
+          'port must be specified when connecting via tcp');
       }
-      _sock = _connect_tcp(host, port);
+      _sock = await _connect_tcp(host, port);
     }
+
+    _stringStream = _sock.transform(socketTransformer).asBroadcastStream();
 
     try {
-      var helloLine = String.fromCharCodes(_sock.readSync(100));
-      print(helloLine);
+      await _hello();
     } catch(e) {
       print(e);
-      disconnect();
+      await disconnect();
       rethrow;
     }
+    return;
   }
 
-  void disconnect() {
+  Future<void> disconnect() async {
     print('Disconnecting');
     if(_sock != null) {
-      _sock.closeSync();
+      await _sock.close();
     }
     reset();
   }
 
-  RawSynchronousSocket _connect_unix(String host) {
+  Future<Socket> _connect_unix(String host) async {
     throw UnimplementedError(
       "dart:io Sockets don't support Unix sockets");
   }
 
-  RawSynchronousSocket _connect_tcp(String host, String port) {
-    var sock = RawSynchronousSocket.connectSync(host, int.parse(port));
+  Future<Socket> _connect_tcp(String host, String port) async {
+    var sock = await Socket.connect(host, int.parse(port));
     return sock;
   } 
 
-
-
+  Future<void> _hello() async {
+    var hello = await _stringStream.first;
+    if(!hello.endsWith('\n')) {
+      throw ConnectionException('Connection lost while reading MPD hello');
+    }
+    hello = hello.trim();
+    if(!hello.startsWith(HELLO_PREFIX)) {
+      throw ProtocolException("Got invalid MPD hello: '$hello'");
+    }
+    mpdVersion = hello.substring(HELLO_PREFIX.length).trim();
+    return;
+  }
 
   void _send(String command, List<String> args, String retVal) {
     if(commandList != null) {
@@ -82,7 +103,7 @@ class MPDClient extends MPDClientBase {
     }
   }
 
-  void _write_command(String command, {List args}) {
+  Future<void> _write_command(String command, {List args}) async {
     var parts = [command];
     args ??= [];
     for (var arg in args) {
@@ -106,15 +127,46 @@ class MPDClient extends MPDClientBase {
     if(command == 'password') {
       print('Calling MPD password(******)');
     } else {
-      print('Calling MPD $command$args');
+      print('Calling MPD $command $args');
     }
 
     var cmd = parts.join(' ');
-    _write_line(cmd);
+    await _write_line(cmd);
   }
 
-  void _write_line(line) {
-    //_sock.write(line);
-    //_sock.flush();
+  Future<void> _write_line(String line) async {
+    _sock.writeln(line);
+    await _sock.flush();
+  }
+
+  @override
+  Future<dynamic> noSuchMethod(Invocation invocation) async {
+    var cmd = _getSymbolName(invocation.memberName.toString());
+    unawaited(_write_command(cmd));
+    // await _write_command(cmd);
+    var responseStream = _stringStream.timeout(
+      Duration(seconds: 5),
+      onTimeout: (_) {
+        throw ConnectionException('Response incomplete');
+      }).takeWhile((String element) {
+        element = element.trim();
+        if(element == 'OK'){
+          return false;
+        }
+        if(element.startsWith('ACK')) {
+          throw ProtocolException("Error response from MPD: $element");
+        }
+        return true;
+    });
+    await for (var line in responseStream) {
+      print(line);
+    }
+  }
+
+  // This is apparently acceptable
+  // https://github.com/dart-lang/sdk/issues/28372
+  String _getSymbolName(String rawSymbolString) {
+    var exp = RegExp(r'Symbol\(\"([a-zA-Z_0-9]*)\"\)');
+    return exp.firstMatch(rawSymbolString).group(1);
   }
 }
